@@ -37,8 +37,10 @@ const addBerthVisible = ref(false);
 const addBerthForm = reactive({ berthNo: '', designDepth: 4.5 });
 
 const recentCalls = computed(() => {
-  const numbers = new Set(portBerths.value.map((b) => b.berthNo));
-  return portStore.callsSorted.filter((c) => numbers.has(c.berthNo)).slice(0, 8);
+  // 只展示有效流水（已更正 / 已撤销不计）；有 portId 的按归属渔港，旧数据按本港泊位号兜底
+  return portStore.effectiveCallsSorted
+    .filter((c) => (c.portId ? c.portId === portId.value : portBerths.value.some((b) => b.berthNo === c.berthNo)))
+    .slice(0, 8);
 });
 
 const supply = computed(() => (port.value ? supplyText(port.value.supply) : '—'));

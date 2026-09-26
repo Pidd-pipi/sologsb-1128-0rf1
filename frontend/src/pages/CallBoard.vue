@@ -9,8 +9,27 @@ import { useBerthStatus } from '../hooks/useBerthStatus';
 import BerthGrid from '../components/common/BerthGrid.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { Berth } from '../types/berth';
-import { CALL_TYPES, VISA_STATUSES, emptyCallDraft, type CallDraft, type CallType } from '../types/call';
-import { formatDateTime, formatNumber, isToday, nowLocalInputValue, toPlain } from '../utils/format';
+import {
+  CALL_TYPES,
+  VISA_STATUSES,
+  callChain,
+  callState,
+  emptyCallDraft,
+  isCorrectionOpen,
+  isFailureLog,
+  type CallCorrection,
+  type CallDraft,
+  type CallType,
+  type PortCall,
+} from '../types/call';
+import {
+  formatDateTime,
+  formatNumber,
+  isToday,
+  isoToLocalInputValue,
+  nowLocalInputValue,
+  toPlain,
+} from '../utils/format';
 
 interface CallForm extends CallDraft {
   portId: string;
@@ -41,11 +60,18 @@ const vesselOptions = computed(() => vesselStore.vessels);
 
 const selectedVessel = computed(() => vesselStore.vesselById(form.value.vesselId));
 
-/** 进港只能选空闲泊位；出港只能选已占用泊位 */
+/**
+ * 进港只能选空闲泊位（不能挤掉别的船）；
+ * 出港只能选「空闲」或「本船当前占用」的泊位。
+ */
 const berthOptions = computed(() => {
-  const wanted = form.value.type === '进港' ? '空闲' : '占用';
-  return portStore.berths
-    .filter((b) => b.status === wanted)
+  const list =
+    form.value.type === '进港'
+      ? portStore.berths.filter((b) => b.status === '空闲')
+      : portStore.berths.filter(
+          (b) => b.status === '空闲' || (b.status === '占用' && b.vesselId === form.value.vesselId),
+        );
+  return list
     .map((b) => ({
       value: `${b.portId}|${b.berthNo}`,
       label: `${portStore.portById(b.portId)?.name ?? b.portId} · ${b.berthNo}`,
@@ -71,14 +97,18 @@ const focusBerths = computed<Berth[]>(() =>
 const berthRef = computed(() => portStore.berths);
 const { summary } = useBerthStatus(berthRef, computed(() => focusPortId.value));
 
+/** 今日全部流水（含已更正、已撤销，用于回看处理链） */
 const todayCalls = computed(() => portStore.callsSorted.filter((c) => isToday(c.time)));
 
+/** 今日有效流水：已更正、已撤销的记录不再计入统计 */
+const todayEffective = computed(() => todayCalls.value.filter((c) => callState(c) === '有效'));
+
 const todayStats = computed(() => ({
-  inbound: todayCalls.value.filter((c) => c.type === '进港').length,
-  outbound: todayCalls.value.filter((c) => c.type === '出港').length,
-  ice: todayCalls.value.reduce((sum, c) => sum + c.iceKg, 0),
-  fuel: todayCalls.value.reduce((sum, c) => sum + c.fuelL, 0),
-  unload: todayCalls.value.reduce((sum, c) => sum + c.unloadKg, 0),
+  inbound: todayEffective.value.filter((c) => c.type === '进港').length,
+  outbound: todayEffective.value.filter((c) => c.type === '出港').length,
+  ice: todayEffective.value.reduce((sum, c) => sum + c.iceKg, 0),
+  fuel: todayEffective.value.reduce((sum, c) => sum + c.fuelL, 0),
+  unload: todayEffective.value.reduce((sum, c) => sum + c.unloadKg, 0),
 }));
 
 function hasContent(value: CallForm): boolean {
@@ -116,8 +146,8 @@ watch(
 );
 
 watch(
-  () => form.value.type,
-  (type: CallType) => {
+  () => [form.value.type, form.value.vesselId] as const,
+  () => {
     const valid = berthOptions.value.some((opt) => opt.value === berthKey.value);
     if (!valid) berthKey.value = '';
   },
@@ -166,6 +196,176 @@ async function submit(): Promise<void> {
 
 function openVessel(vesselId: string): void {
   void router.push(`/vessels/${vesselId}`);
+}
+
+/* ---------------- 更正 ---------------- */
+
+const correctVisible = ref(false);
+const correctSaving = ref(false);
+const correctRef = ref<FormInstance>();
+const correctingId = ref('');
+const correctForm = ref<CallCorrection & { note: string }>({
+  vesselId: '',
+  time: '',
+  portId: '',
+  berthNo: '',
+  iceKg: 0,
+  fuelL: 0,
+  unloadKg: 0,
+  note: '',
+});
+
+const correctRules: FormRules = {
+  vesselId: [{ required: true, message: '请选择渔船', trigger: 'change' }],
+  portId: [{ required: true, message: '请选择泊位', trigger: 'change' }],
+  time: [{ required: true, message: '请选择时间', trigger: 'change' }],
+};
+
+const correctingCall = computed(() => portStore.callById(correctingId.value));
+
+/** 更正弹窗可选泊位：空闲 / 维修排除 / 本船占用位可改回；源泊位始终保留（只换船不换位时要能选中） */
+const correctBerthOptions = computed(() => {
+  const vesselId = correctForm.value.vesselId;
+  const source = correctingCall.value;
+  return portStore.berths
+    .filter((b) => {
+      if (b.status === '维修') return false;
+      if (b.status === '空闲' || b.vesselId === vesselId) return true;
+      return Boolean(source) && source!.portId === b.portId && source!.berthNo === b.berthNo;
+    })
+    .map((b) => ({
+      value: `${b.portId}|${b.berthNo}`,
+      label: `${portStore.portById(b.portId)?.name ?? b.portId} · ${b.berthNo}`,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+});
+
+const correctBerthKey = computed({
+  get: () =>
+    correctForm.value.portId && correctForm.value.berthNo
+      ? `${correctForm.value.portId}|${correctForm.value.berthNo}`
+      : '',
+  set: (key: string) => {
+    const [portId, berthNo] = String(key).split('|');
+    correctForm.value.portId = portId ?? '';
+    correctForm.value.berthNo = berthNo ?? '';
+  },
+});
+
+watch(
+  () => correctForm.value.vesselId,
+  () => {
+    const valid = correctBerthOptions.value.some((opt) => opt.value === correctBerthKey.value);
+    if (!valid) correctBerthKey.value = '';
+  },
+);
+
+function openCorrect(call: PortCall): void {
+  if (!isCorrectionOpen(call)) {
+    ElMessage.warning('只有未签证的有效记录可以更正');
+    return;
+  }
+  correctingId.value = call.id;
+  correctForm.value = {
+    vesselId: call.vesselId,
+    time: isoToLocalInputValue(call.time),
+    portId: call.portId ?? '',
+    berthNo: call.berthNo,
+    iceKg: call.iceKg,
+    fuelL: call.fuelL,
+    unloadKg: call.unloadKg,
+    note: '',
+  };
+  correctVisible.value = true;
+}
+
+async function submitCorrect(): Promise<void> {
+  if (!correctRef.value) return;
+  const valid = await correctRef.value.validate().catch(() => false);
+  if (!valid) return;
+  correctSaving.value = true;
+  try {
+    const fresh = await portStore.correctCall(correctingId.value, { ...correctForm.value });
+    ElMessage.success(`已更正，新记录已接续：${fresh.vesselName} · 泊位 ${fresh.berthNo}`);
+    correctVisible.value = false;
+  } catch (error) {
+    ElMessage.error(`更正失败：${(error as Error).message}（失败原因已写入处理链）`);
+  } finally {
+    correctSaving.value = false;
+  }
+}
+
+/* ---------------- 撤销 ---------------- */
+
+const cancelVisible = ref(false);
+const cancelSaving = ref(false);
+const cancelingId = ref('');
+const cancelReason = ref('');
+
+const cancelingCall = computed(() => portStore.callById(cancelingId.value));
+
+function openCancel(call: PortCall): void {
+  if (callState(call) !== '有效') {
+    ElMessage.warning('只有有效记录可以撤销');
+    return;
+  }
+  cancelingId.value = call.id;
+  cancelReason.value = '';
+  cancelVisible.value = true;
+}
+
+async function submitCancel(): Promise<void> {
+  if (!cancelReason.value.trim()) {
+    ElMessage.warning('请填写撤销原因');
+    return;
+  }
+  cancelSaving.value = true;
+  try {
+    await portStore.cancelCall(cancelingId.value, cancelReason.value);
+    ElMessage.success('已撤销，该记录不再计入在港状态与今日统计');
+    cancelVisible.value = false;
+  } catch (error) {
+    ElMessage.error(`撤销失败：${(error as Error).message}（失败原因已写入处理链）`);
+  } finally {
+    cancelSaving.value = false;
+  }
+}
+
+/* ---------------- 处理链回看 ---------------- */
+
+const chainVisible = ref(false);
+const chainCallId = ref('');
+
+const chainRecords = computed(() => (chainCallId.value ? callChain(portStore.calls, chainCallId.value) : []));
+
+/** 历史流水状态筛选（登记页回看任意日期的处理链与失败原因） */
+const historyStateFilter = ref<'全部' | '有效' | '已更正' | '已撤销'>('全部');
+
+const filteredHistory = computed(() => {
+  const list = portStore.callsSorted;
+  return historyStateFilter.value === '全部' ? list : list.filter((c) => callState(c) === historyStateFilter.value);
+});
+
+function openChain(call: PortCall): void {
+  chainCallId.value = call.id;
+  chainVisible.value = true;
+}
+
+function chainNodeTagType(node: PortCall): 'success' | 'warning' | 'info' {
+  const state = callState(node);
+  if (state === '有效') return 'success';
+  if (state === '已更正') return 'warning';
+  return 'info';
+}
+
+function stateTagType(state: ReturnType<typeof callState>): 'success' | 'warning' | 'info' {
+  if (state === '有效') return 'success';
+  if (state === '已更正') return 'warning';
+  return 'info';
+}
+
+function rowClassName({ row }: { row: PortCall }): string {
+  return callState(row) === '已撤销' ? 'call-row--canceled' : '';
 }
 </script>
 
@@ -231,7 +431,7 @@ function openVessel(vesselId: string): void {
               <el-select
                 id="call-berth"
                 v-model="berthKey"
-                :placeholder="form.type === '进港' ? '选择空闲泊位' : '选择已占用泊位'"
+                :placeholder="form.type === '进港' ? '选择空闲泊位' : '选择本船占用 / 空闲泊位'"
                 style="width: 100%"
                 data-testid="call-berth"
               >
@@ -269,13 +469,16 @@ function openVessel(vesselId: string): void {
               <el-button v-if="selectedVessel" text type="primary" @click="openVessel(selectedVessel.id)">查看渔船档案</el-button>
             </el-form-item>
           </el-form>
+          <p class="detail-hint">
+            登记出错时：未签证记录可直接「更正」（原记录留档并接续新记录）；任意记录可「撤销」（需填原因，留档但不再计入在港状态与统计）。
+          </p>
         </el-card>
       </el-col>
 
       <el-col :lg="11" :md="24">
         <el-card shadow="never" class="detail-card">
           <template #header>
-            <span class="card-title">今日统计</span>
+            <span class="card-title">今日统计<span class="card-title__sub">（仅有效记录）</span></span>
           </template>
           <div class="stat-row">
             <div class="stat"><span class="stat__label">进港</span><b>{{ todayStats.inbound }}</b></div>
@@ -304,14 +507,36 @@ function openVessel(vesselId: string): void {
     </el-row>
 
     <el-card shadow="never" class="detail-card">
-      <template #header><span class="card-title">今日流水（{{ todayCalls.length }} 条）</span></template>
-      <el-table :data="todayCalls" size="small" border empty-text="今日暂无进出港流水" data-testid="today-calls">
+      <template #header>
+        <span class="card-title">
+          今日流水（{{ todayCalls.length }} 条，有效 {{ todayEffective.length }} 条）
+        </span>
+      </template>
+      <el-table
+        :data="todayCalls"
+        size="small"
+        border
+        empty-text="今日暂无进出港流水"
+        data-testid="today-calls"
+        :row-class-name="rowClassName"
+      >
+        <el-table-column label="状态" width="86">
+          <template #default="scope">
+            <el-tag size="small" :type="stateTagType(callState(scope.row))" data-testid="call-state">
+              {{ callState(scope.row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="vesselName" label="船名" min-width="130" />
         <el-table-column prop="type" label="类型" width="80" />
         <el-table-column label="时间" min-width="150">
           <template #default="scope">{{ formatDateTime(scope.row.time) }}</template>
         </el-table-column>
-        <el-table-column prop="berthNo" label="泊位号" width="90" />
+        <el-table-column label="泊位" min-width="150">
+          <template #default="scope">
+            {{ portStore.portById(scope.row.portId)?.name ?? '—' }} · {{ scope.row.berthNo }}
+          </template>
+        </el-table-column>
         <el-table-column label="加冰 kg" min-width="100">
           <template #default="scope">{{ formatNumber(scope.row.iceKg, 0) }}</template>
         </el-table-column>
@@ -321,9 +546,248 @@ function openVessel(vesselId: string): void {
         <el-table-column label="卸货 kg" min-width="110">
           <template #default="scope">{{ formatNumber(scope.row.unloadKg, 0) }}</template>
         </el-table-column>
-        <el-table-column prop="visaStatus" label="签证状态" width="110" />
+        <el-table-column prop="visaStatus" label="签证状态" width="100" />
+        <el-table-column label="操作" width="210" fixed="right">
+          <template #default="scope">
+            <el-button
+              text
+              type="primary"
+              size="small"
+              data-testid="correct-call"
+              :disabled="!isCorrectionOpen(scope.row)"
+              @click="openCorrect(scope.row)"
+            >
+              更正
+            </el-button>
+            <el-button
+              text
+              type="danger"
+              size="small"
+              data-testid="cancel-call"
+              :disabled="callState(scope.row) !== '有效'"
+              @click="openCancel(scope.row)"
+            >
+              撤销
+            </el-button>
+            <el-button text size="small" data-testid="open-chain" @click="openChain(scope.row)">处理链</el-button>
+          </template>
+        </el-table-column>
       </el-table>
     </el-card>
+
+    <el-card shadow="never" class="detail-card">
+      <template #header>
+        <div class="history-head">
+          <span class="card-title">历史流水（{{ filteredHistory.length }} 条）</span>
+          <el-radio-group v-model="historyStateFilter" size="small" data-testid="history-filter">
+            <el-radio-button value="全部">全部</el-radio-button>
+            <el-radio-button value="有效">有效</el-radio-button>
+            <el-radio-button value="已更正">已更正</el-radio-button>
+            <el-radio-button value="已撤销">已撤销</el-radio-button>
+          </el-radio-group>
+        </div>
+      </template>
+      <el-table :data="filteredHistory" size="small" border max-height="360" empty-text="暂无流水" data-testid="history-calls">
+        <el-table-column label="状态" width="86">
+          <template #default="scope">
+            <el-tag size="small" :type="stateTagType(callState(scope.row))">{{ callState(scope.row) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="vesselName" label="船名" min-width="130" />
+        <el-table-column prop="type" label="类型" width="72" />
+        <el-table-column label="时间" min-width="150">
+          <template #default="scope">{{ formatDateTime(scope.row.time) }}</template>
+        </el-table-column>
+        <el-table-column label="泊位" min-width="140">
+          <template #default="scope">
+            {{ portStore.portById(scope.row.portId)?.name ?? '—' }} · {{ scope.row.berthNo }}
+          </template>
+        </el-table-column>
+        <el-table-column label="补给" min-width="180">
+          <template #default="scope">
+            冰 {{ formatNumber(scope.row.iceKg, 0) }} / 油 {{ formatNumber(scope.row.fuelL, 0) }} / 卸 {{ formatNumber(scope.row.unloadKg, 0) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="撤销原因" min-width="160">
+          <template #default="scope">
+            <span v-if="scope.row.cancelReason" class="cancel-text">{{ scope.row.cancelReason }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="210" fixed="right">
+          <template #default="scope">
+            <el-button
+              text
+              type="primary"
+              size="small"
+              :disabled="!isCorrectionOpen(scope.row)"
+              @click="openCorrect(scope.row)"
+            >
+              更正
+            </el-button>
+            <el-button
+              text
+              type="danger"
+              size="small"
+              :disabled="callState(scope.row) !== '有效'"
+              @click="openCancel(scope.row)"
+            >
+              撤销
+            </el-button>
+            <el-button text size="small" @click="openChain(scope.row)">处理链</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <!-- 更正弹窗 -->
+    <el-dialog v-model="correctVisible" title="更正进出港记录" width="620px" data-testid="correct-dialog">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="保存后原记录留档为「已更正」，并接续一条新记录；泊位状态按有效流水自动重算，不会挤掉别的船。"
+        class="dialog-alert"
+      />
+      <el-form
+        v-if="correctingCall"
+        ref="correctRef"
+        :model="correctForm"
+        :rules="correctRules"
+        label-width="110px"
+        data-testid="correct-form"
+      >
+        <el-form-item label="原记录">
+          <span class="muted">
+            {{ correctingCall.vesselName }} · {{ correctingCall.type }} · {{ formatDateTime(correctingCall.time) }} · 泊位 {{ correctingCall.berthNo }}
+          </span>
+        </el-form-item>
+        <el-form-item label="渔船" prop="vesselId">
+          <el-select v-model="correctForm.vesselId" placeholder="请选择渔船" filterable style="width: 100%">
+            <el-option
+              v-for="v in vesselOptions"
+              :key="v.id"
+              :label="`${v.name}（${v.homePort}）`"
+              :value="v.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="时间" prop="time">
+          <el-date-picker
+            v-model="correctForm.time"
+            type="datetime"
+            value-format="YYYY-MM-DDTHH:mm"
+            placeholder="选择时间"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <el-form-item label="泊位" prop="portId">
+          <el-select v-model="correctBerthKey" placeholder="选择空闲 / 本船占用泊位" style="width: 100%">
+            <el-option v-for="opt in correctBerthOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
+        </el-form-item>
+        <el-row :gutter="12">
+          <el-col :span="8">
+            <el-form-item label="加冰 kg">
+              <el-input-number v-model="correctForm.iceKg" :min="0" :max="20000" :step="50" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="加油 L">
+              <el-input-number v-model="correctForm.fuelL" :min="0" :max="20000" :step="50" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="卸货 kg">
+              <el-input-number v-model="correctForm.unloadKg" :min="0" :max="200000" :step="100" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="更正说明">
+          <el-input v-model="correctForm.note" type="textarea" :rows="2" placeholder="可选，如：登记员笔误" />
+        </el-form-item>
+        <el-form-item v-if="correctingCall">
+          <span class="muted">进出港类型与签证状态（{{ correctingCall.visaStatus }}）沿用原记录，不在更正范围内。</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="correctVisible = false">取消</el-button>
+        <el-button type="primary" :loading="correctSaving" data-testid="submit-correct" @click="submitCorrect">保存更正</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 撤销弹窗 -->
+    <el-dialog v-model="cancelVisible" title="撤销进出港记录" width="520px" data-testid="cancel-dialog">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="撤销后记录保留可查，但不再计入在港状态与今日统计；泊位状态按最近一条有效流水自动重算。"
+        class="dialog-alert"
+      />
+      <div v-if="cancelingCall" class="cancel-source">
+        <el-tag size="small" :type="cancelingCall.type === '进港' ? 'primary' : 'success'">{{ cancelingCall.type }}</el-tag>
+        <span>{{ cancelingCall.vesselName }} · {{ formatDateTime(cancelingCall.time) }} · 泊位 {{ cancelingCall.berthNo }}</span>
+      </div>
+      <el-form label-width="90px" data-testid="cancel-form">
+        <el-form-item label="撤销原因" required>
+          <el-input
+            v-model="cancelReason"
+            type="textarea"
+            :rows="3"
+            placeholder="必填，如：重复登记 / 船名泊位录错"
+            data-testid="cancel-reason"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="cancelVisible = false">取消</el-button>
+        <el-button type="danger" :loading="cancelSaving" data-testid="submit-cancel" @click="submitCancel">确认撤销</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 处理链弹窗 -->
+    <el-dialog v-model="chainVisible" title="更正 / 撤销处理链" width="640px" data-testid="chain-dialog">
+      <el-timeline v-if="chainRecords.length">
+        <el-timeline-item
+          v-for="(node, index) in chainRecords"
+          :key="node.id"
+          :type="chainNodeTagType(node)"
+          placement="top"
+          :timestamp="formatDateTime(node.time)"
+        >
+          <div class="chain-head">
+            <el-tag size="small" :type="chainNodeTagType(node)">{{ callState(node) }}</el-tag>
+            <el-tag size="small" :type="node.type === '进港' ? 'primary' : 'success'">{{ node.type }}</el-tag>
+            <b>{{ node.vesselName }}</b>
+            <span class="muted">泊位 {{ node.berthNo }}</span>
+            <span v-if="index === 0" class="muted">（原始记录）</span>
+          </div>
+          <div class="chain-metrics muted">
+            加冰 {{ formatNumber(node.iceKg, 0) }} kg · 加油 {{ formatNumber(node.fuelL, 0) }} L · 卸货 {{ formatNumber(node.unloadKg, 0) }} kg · {{ node.visaStatus }}
+          </div>
+          <div v-if="node.cancelReason" class="chain-reason">
+            撤销原因（{{ formatDateTime(node.canceledAt) }}）：{{ node.cancelReason }}
+          </div>
+          <ul v-if="node.logs?.length" class="chain-logs">
+            <li
+              v-for="(log, i) in node.logs"
+              :key="i"
+              :class="{ 'chain-logs__item--fail': isFailureLog(log) }"
+              data-testid="chain-log"
+            >
+              <el-tag size="small" :type="isFailureLog(log) ? 'danger' : 'info'">{{ log.action }}</el-tag>
+              <span>{{ formatDateTime(log.at) }}</span>
+              <span v-if="log.detail">{{ log.detail }}</span>
+            </li>
+          </ul>
+        </el-timeline-item>
+      </el-timeline>
+      <EmptyState v-else title="无处理链" description="该记录尚未发生更正或撤销。" />
+      <template #footer>
+        <el-button @click="chainVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -351,8 +815,16 @@ function openVessel(vesselId: string): void {
   font-weight: 600;
   color: #17324d;
 }
+.card-title__sub {
+  font-weight: 400;
+  font-size: 12px;
+  color: #8592a0;
+}
 .draft-alert {
   border-radius: 10px;
+}
+.dialog-alert {
+  margin-bottom: 14px;
 }
 .stat-row {
   display: flex;
@@ -376,5 +848,65 @@ function openVessel(vesselId: string): void {
   margin: 10px 0 0;
   font-size: 12px;
   color: #6b7c8c;
+}
+.muted {
+  color: #8592a0;
+  font-size: 12px;
+}
+.cancel-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 14px;
+  font-size: 13px;
+  color: #4b5c6d;
+}
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.cancel-text {
+  font-size: 12px;
+  color: #b53f3f;
+}
+.chain-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chain-metrics {
+  margin-top: 4px;
+}
+.chain-reason {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #b53f3f;
+}
+.chain-logs {
+  margin: 8px 0 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chain-logs li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #5b6b7b;
+}
+.chain-logs__item--fail {
+  color: #b53f3f;
+}
+:deep(.call-row--canceled) {
+  color: #a8b4bf;
+  text-decoration: line-through;
 }
 </style>

@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview --port 5173"
+    "preview": "vite preview --port 5173",
+    "verify:calls": "tsx scripts/verify-corrections.mts",
+    "verify:migration": "tsx scripts/verify-migration.mts",
+    "verify": "npm run verify:calls && npm run verify:migration"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -18,6 +21,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.1.4",
+    "fake-indexeddb": "^6.2.5",
+    "tsx": "^4.23.15",
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
     "vue-tsc": "^2.1.6"

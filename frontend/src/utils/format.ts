@@ -52,6 +52,13 @@ export function toLocalInputValue(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** ISO 字符串 → datetime-local 输入框可用的值，非法值回退为空串 */
+export function isoToLocalInputValue(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : toLocalInputValue(d);
+}
+
 /** 当前时间对应的 datetime-local 输入值 */
 export function nowLocalInputValue(): string {
   return toLocalInputValue(new Date());
