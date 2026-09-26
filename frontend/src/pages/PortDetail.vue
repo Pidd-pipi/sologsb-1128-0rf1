@@ -37,8 +37,11 @@ const addBerthVisible = ref(false);
 const addBerthForm = reactive({ berthNo: '', designDepth: 4.5 });
 
 const recentCalls = computed(() => {
+  // 泊位号在各渔港间会重复，优先按 portId 精确匹配；历史记录缺失时退回泊位号匹配
   const numbers = new Set(portBerths.value.map((b) => b.berthNo));
-  return portStore.callsSorted.filter((c) => numbers.has(c.berthNo)).slice(0, 8);
+  return portStore.effectiveCalls
+    .filter((c) => (c.portId ? c.portId === portId.value : numbers.has(c.berthNo)))
+    .slice(0, 8);
 });
 
 const supply = computed(() => (port.value ? supplyText(port.value.supply) : '—'));

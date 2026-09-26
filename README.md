@@ -44,7 +44,7 @@ sologsb-1128/
 │   └── src/
 │       ├── types/              # port.ts / vessel.ts / call.ts / berth.ts（4 个数据模型）
 │       ├── stores/             # portStore.ts / vesselStore.ts / uiStore.ts
-│       ├── db/                 # index.ts（Dexie v1→v3 迁移）/ berth.ts / seed.ts
+│       ├── db/                 # index.ts（Dexie v1→v4 迁移）/ berth.ts / seed.ts
 │       ├── components/common/  # PortCard / BerthGrid / VesselSpecTable / MapPanel / EmptyState
 │       ├── hooks/              # useAmapLoader / useBerthStatus / useLocalDraft
 │       ├── pages/              # PortList / PortDetail / VesselList / VesselDetail / CallBoard / MapView
@@ -61,7 +61,7 @@ sologsb-1128/
 | `/ports/:id` | 渔港详情：基本信息与补给能力、SVG 泊位网格（点击查看占用船舶）、在港船舶与近日流水 | 四个模型 |
 | `/vessels` | 渔船检索：按作业类型、主机功率区间、总吨位与船籍港组合查询 | FishingVessel |
 | `/vessels/:id` | 渔船档案详情：主尺度、主机功率、作业类型、证书有效期与进出港时间线 | FishingVessel、PortCall |
-| `/calls` | 进出港登记：选择渔船与类型，填写泊位号、加冰量、加油量、卸货量并同步泊位状态 | PortCall、Berth、FishingVessel |
+| `/calls` | 进出港登记：选择渔船与类型，填写泊位号、加冰量、加油量、卸货量并同步泊位状态；未签证记录可更正（改渔船、时间、泊位、补给量），任意记录可填原因撤销，支持回看处理链与泊位重算失败原因 | PortCall、Berth、FishingVessel |
 | `/map` | 渔港与在港渔船分布：高德 JS API 标记，未配置 key 时为 SVG 网格视图，点选弹出泊位占用摘要 | FishingPort、Berth |
 
 ## 数据存储说明
@@ -70,6 +70,17 @@ sologsb-1128/
   - `v1`：建 `ports`、`vessels` 表
   - `v2`：新增 `calls` 表与 `vesselId` 索引
   - `v3`：新增 `berths` 表，并按每个渔港登记的泊位数生成初始泊位记录
+  - `v4`：流水补记所属渔港 `portId` 与生命周期字段（更正链 / 撤销原因），并以全部有效流水回放重算泊位状态，修复旧版靠反向流水修正导致的在港偏差
+
+## 更正与撤销
+
+登记员把泊位或补给量写错时，无需再补反向流水：
+
+- **更正**：仅未签证记录（待签证 / 免签）可更正，可改渔船、时间、泊位和补给数量（进出港类型、签证状态不可改）。保存后**原记录保留并标记「已更正」**，接出一条新记录继续生效，新记录通过 `correctedFromId` / `correctedById` 与原记录相连。
+- **撤销**：必须填写撤销原因；记录保留在库中并标记「已撤销」，但不再计入今日统计、累计补给与在港状态。
+- **泊位重算**：登记 / 更正 / 撤销后，泊位状态一律以「这艘船及全港最近一条有效进出港记录」按时间回放重算：进港占用、出港释放；维修泊位保留人工状态；泊位已被他船占用时该条记录**不会挤掉别的船**，失败原因写回流水并在登记页醒目提示。
+- **处理链回看**：登记页今日流水提供「更正 / 撤销 / 处理链」操作，处理链按更正关系串联原记录与历次更正记录，可回看撤销原因与泊位同步失败原因。
+- 旧数据（v3 及更早）打开后照常使用：v4 迁移回填 `portId`（同名泊位跨渔港时不做歧义猜测）并立即做一次全量重算。
 - **表单草稿走 localStorage**（键前缀 `gbfishport:draft:`），例如进出港登记草稿 `gbfishport:draft:call-board`，提交成功后自动清空。
 - 首次打开会自动写入一组演示数据（4 座渔港、6 艘渔船、8 条进出港流水与对应泊位），便于直接查看各页面效果。
 - 容器无状态：不使用数据库服务、不挂载命名卷，清空浏览器站点数据即可重置。
